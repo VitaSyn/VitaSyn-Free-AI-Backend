@@ -3,6 +3,8 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import mongoose from 'mongoose';
+import twilio from 'twilio';
+import { createClerkClient, verifyToken } from '@clerk/backend';
 import { User } from '../models/User.js';
 
 const router = express.Router();
@@ -26,6 +28,196 @@ async function findUserByPhone(phone) {
   if (isConnected()) return User.findOne({ phone });
   return memUsers.find((u) => u.phone === phone) || null;
 }
+
+function normalizePhone(phone) {
+  const value = String(phone || '').trim();
+  return /^\+[1-9]\d{7,14}$/.test(value) ? value : null;
+}
+
+async function findUserByVerifiedPhone(phone) {
+  const digits = phone.replace(/\D/g, '');
+  const nationalSuffix = digits.slice(-10);
+  if (isConnected()) {
+    return User.findOne({
+      $or: [
+        { phone },
+        { phone: digits },
+        { phone: { $regex: `${nationalSuffix.split('').join('\\D*')}$` } },
+      ],
+    });
+  }
+  return memUsers.find((user) => {
+    const storedDigits = String(user.phone || '').replace(/\D/g, '');
+    return storedDigits === digits || (storedDigits.length === 10 && digits.endsWith(storedDigits));
+  }) || null;
+}
+
+async function findUserByClerkId(clerkId) {
+  if (isConnected()) return User.findOne({ clerkId });
+  return memUsers.find((user) => user.clerkId === clerkId) || null;
+}
+
+function createAppSession(user) {
+  const token = jwt.sign(
+    { userId: user.userId, email: user.email },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+
+  return {
+    success: true,
+    token,
+    user: {
+      userId: user.userId,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      age: user.age,
+      sex: user.sex,
+      results: user.results || [],
+    },
+  };
+}
+
+function getTwilioVerifyService() {
+  const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_VERIFY_SERVICE_SID } = process.env;
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_VERIFY_SERVICE_SID) return null;
+  return twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    .verify.v2.services(TWILIO_VERIFY_SERVICE_SID);
+}
+
+/** POST /api/auth/phone/send-otp */
+router.post('/phone/send-otp', async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  if (!phone) {
+    return res.status(400).json({ success: false, code: 'INVALID_PHONE', message: 'Enter a valid phone number in international format, such as +14155552671.' });
+  }
+
+  const verifyService = getTwilioVerifyService();
+  if (!verifyService) {
+    return res.status(503).json({ success: false, message: 'Phone verification is not configured.' });
+  }
+
+  try {
+    await verifyService.verifications.create({ to: phone, channel: 'sms' });
+    return res.json({ success: true, message: 'Verification code sent.' });
+  } catch (err) {
+    console.error('Twilio send verification error:', err.message);
+    return res.status(502).json({ success: false, message: 'Could not send a verification code. Check the phone number and try again.' });
+  }
+});
+
+/** POST /api/auth/phone/verify-otp */
+router.post('/phone/verify-otp', async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  const code = String(req.body.code || '').trim();
+  if (!phone || !/^\d{6}$/.test(code)) {
+    return res.status(400).json({ success: false, code: 'INVALID_OTP', message: 'Enter a valid phone number and 6-digit code.' });
+  }
+
+  const verifyService = getTwilioVerifyService();
+  if (!verifyService) {
+    return res.status(503).json({ success: false, message: 'Phone verification is not configured.' });
+  }
+
+  try {
+    const check = await verifyService.verificationChecks.create({ to: phone, code });
+    if (check.status !== 'approved') {
+      return res.status(401).json({ success: false, code: 'INVALID_OTP', message: 'That code is invalid or expired.' });
+    }
+
+    let user = await findUserByVerifiedPhone(phone);
+    if (!user) {
+      const digits = phone.replace(/\D/g, '');
+      const newUser = {
+        userId: generate13DigitUserId(),
+        name: 'VitaSyn User',
+        email: `phone-${digits}@users.vitasyn.invalid`,
+        phone,
+        age: 0,
+        sex: 'other',
+        results: [],
+      };
+      if (isConnected()) {
+        user = await User.create(newUser);
+      } else {
+        user = { ...newUser, createdAt: new Date() };
+        memUsers.push(user);
+      }
+    } else if (user.phone !== phone) {
+      user.phone = phone;
+      if (isConnected()) await user.save();
+    }
+
+    return res.json(createAppSession(user));
+  } catch (err) {
+    console.error('Twilio verify code error:', err.message);
+    return res.status(502).json({ success: false, message: 'Could not verify the code. Please try again.' });
+  }
+});
+
+/** POST /api/auth/google/session */
+router.post('/google/session', async (req, res) => {
+  const secretKey = process.env.CLERK_SECRET_KEY;
+  const sessionToken = String(req.body.sessionToken || '');
+  if (!secretKey) {
+    return res.status(503).json({ success: false, message: 'Google sign-in is not configured on the server.' });
+  }
+  if (!sessionToken) {
+    return res.status(400).json({ success: false, message: 'A Clerk session is required.' });
+  }
+
+  try {
+    const claims = await verifyToken(sessionToken, secretKey);
+    if (!claims.sub) {
+      return res.status(401).json({ success: false, message: 'Invalid Clerk session.' });
+    }
+
+    const clerkClient = createClerkClient({ secretKey });
+    const clerkUser = await clerkClient.users.getUser(claims.sub);
+    const primaryEmail = clerkUser.emailAddresses.find(
+      (address) => address.id === clerkUser.primaryEmailAddressId
+    )?.emailAddress;
+    if (!primaryEmail) {
+      return res.status(400).json({ success: false, message: 'Your Google account must have a verified email address.' });
+    }
+
+    let user = await findUserByClerkId(clerkUser.id);
+    if (!user) {
+      user = await findUserByEmail(primaryEmail);
+      if (user?.clerkId && user.clerkId !== clerkUser.id) {
+        return res.status(409).json({ success: false, message: 'This email is already linked to another sign-in account.' });
+      }
+    }
+
+    if (user) {
+      user.clerkId = clerkUser.id;
+      if (isConnected()) await user.save();
+      else if (!memUsers.some((entry) => entry.userId === user.userId)) memUsers.push(user);
+    } else {
+      const newUser = {
+        userId: generate13DigitUserId(),
+        clerkId: clerkUser.id,
+        name: [clerkUser.firstName, clerkUser.lastName].filter(Boolean).join(' ') || primaryEmail.split('@')[0],
+        email: primaryEmail.toLowerCase(),
+        phone: '',
+        age: 0,
+        sex: 'other',
+        results: [],
+      };
+      if (isConnected()) user = await User.create(newUser);
+      else {
+        user = { ...newUser, createdAt: new Date() };
+        memUsers.push(user);
+      }
+    }
+
+    return res.json(createAppSession(user));
+  } catch (err) {
+    console.error('Clerk session exchange error:', err.message);
+    return res.status(401).json({ success: false, message: 'Could not verify your Google sign-in. Please try again.' });
+  }
+});
 
 // Generate exact 13-character alphanumeric user ID
 function generate13DigitUserId() {
