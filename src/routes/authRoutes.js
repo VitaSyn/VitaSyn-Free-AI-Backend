@@ -3,7 +3,6 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import mongoose from 'mongoose';
-import twilio from 'twilio';
 import { createClerkClient, verifyToken } from '@clerk/backend';
 import { User } from '../models/User.js';
 
@@ -11,6 +10,7 @@ const router = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'vitasyn_secret_key_2025';
 const SALT_ROUNDS = 12;
+const PHONE_OTP_CODE = process.env.PHONE_OTP_CODE || '123456';
 
 // In-memory fallback user store when MongoDB is not connected
 const memUsers = [];
@@ -79,13 +79,6 @@ function createAppSession(user) {
   };
 }
 
-function getTwilioVerifyService() {
-  const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_VERIFY_SERVICE_SID } = process.env;
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_VERIFY_SERVICE_SID) return null;
-  return twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    .verify.v2.services(TWILIO_VERIFY_SERVICE_SID);
-}
-
 /** POST /api/auth/phone/send-otp */
 router.post('/phone/send-otp', async (req, res) => {
   const phone = normalizePhone(req.body.phone);
@@ -93,18 +86,7 @@ router.post('/phone/send-otp', async (req, res) => {
     return res.status(400).json({ success: false, code: 'INVALID_PHONE', message: 'Enter a valid phone number in international format, such as +14155552671.' });
   }
 
-  const verifyService = getTwilioVerifyService();
-  if (!verifyService) {
-    return res.status(503).json({ success: false, message: 'Phone verification is not configured.' });
-  }
-
-  try {
-    await verifyService.verifications.create({ to: phone, channel: 'sms' });
-    return res.json({ success: true, message: 'Verification code sent.' });
-  } catch (err) {
-    console.error('Twilio send verification error:', err.message);
-    return res.status(502).json({ success: false, message: 'Could not send a verification code. Check the phone number and try again.' });
-  }
+  return res.json({ success: true, message: 'Temporary verification code is active. Enter the configured code to continue.' });
 });
 
 /** POST /api/auth/phone/verify-otp */
@@ -115,17 +97,11 @@ router.post('/phone/verify-otp', async (req, res) => {
     return res.status(400).json({ success: false, code: 'INVALID_OTP', message: 'Enter a valid phone number and 6-digit code.' });
   }
 
-  const verifyService = getTwilioVerifyService();
-  if (!verifyService) {
-    return res.status(503).json({ success: false, message: 'Phone verification is not configured.' });
+  if (code !== PHONE_OTP_CODE) {
+    return res.status(401).json({ success: false, code: 'INVALID_OTP', message: 'That code is invalid or expired.' });
   }
 
   try {
-    const check = await verifyService.verificationChecks.create({ to: phone, code });
-    if (check.status !== 'approved') {
-      return res.status(401).json({ success: false, code: 'INVALID_OTP', message: 'That code is invalid or expired.' });
-    }
-
     let user = await findUserByVerifiedPhone(phone);
     if (!user) {
       const digits = phone.replace(/\D/g, '');
@@ -151,7 +127,7 @@ router.post('/phone/verify-otp', async (req, res) => {
 
     return res.json(createAppSession(user));
   } catch (err) {
-    console.error('Twilio verify code error:', err.message);
+    console.error('Phone OTP verification error:', err.message);
     return res.status(502).json({ success: false, message: 'Could not verify the code. Please try again.' });
   }
 });
@@ -168,7 +144,7 @@ router.post('/google/session', async (req, res) => {
   }
 
   try {
-    const claims = await verifyToken(sessionToken, secretKey);
+    const claims = await verifyToken(sessionToken, { secretKey });
     if (!claims.sub) {
       return res.status(401).json({ success: false, message: 'Invalid Clerk session.' });
     }
