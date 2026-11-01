@@ -9,13 +9,9 @@ export function isMongoConnected() {
 }
 
 export async function saveAssessment(data) {
-  try {
-    if (isMongoConnected()) {
-      const doc = new Assessment(data);
-      return await doc.save();
-    }
-  } catch (err) {
-    console.warn('MongoDB save fallback to memory:', err.message);
+  if (isMongoConnected()) {
+    const doc = new Assessment(data);
+    return await doc.save();
   }
 
   // In-memory fallback
