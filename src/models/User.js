@@ -15,9 +15,10 @@ const UserSchema = new mongoose.Schema(
     },
     name: { type: String, required: true, trim: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    phone: { type: String, required: true, trim: true },
+    phone: { type: String, default: '', trim: true },
     age: { type: Number, required: true },
     sex: { type: String, enum: ['male', 'female', 'other'], required: true },
+    profileComplete: { type: Boolean },
     password: { type: String, required: false }, // stored as bcrypt hash for legacy password accounts
     clerkId: { type: String, unique: true, sparse: true },
     resetOtp: { type: String, default: null },

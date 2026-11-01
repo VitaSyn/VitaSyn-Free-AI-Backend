@@ -5,15 +5,18 @@ import crypto from 'crypto';
 import mongoose from 'mongoose';
 import { createClerkClient, verifyToken } from '@clerk/backend';
 import { User } from '../models/User.js';
+import { LoginOtp } from '../models/LoginOtp.js';
 
 const router = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'vitasyn_secret_key_2025';
 const SALT_ROUNDS = 12;
-const PHONE_OTP_CODE = process.env.PHONE_OTP_CODE || '123456';
+const PHONE_OTP_CODE = '123456';
+const LOGIN_OTP_TTL_MS = 2 * 60 * 1000;
 
 // In-memory fallback user store when MongoDB is not connected
 const memUsers = [];
+const memLoginOtps = new Map();
 
 function isConnected() {
   return mongoose.connection.readyState === 1;
@@ -29,9 +32,70 @@ async function findUserByPhone(phone) {
   return memUsers.find((u) => u.phone === phone) || null;
 }
 
-function normalizePhone(phone) {
-  const value = String(phone || '').trim();
-  return /^\+[1-9]\d{7,14}$/.test(value) ? value : null;
+function normalizeLoginIdentifier(value) {
+  const identifier = String(value || '').trim();
+  if (/^\d+$/.test(identifier)) {
+    if (!/^\d{10}$/.test(identifier)) return null;
+    return { kind: 'phone', identifier: `+91${identifier}` };
+  }
+
+  const email = identifier.toLowerCase();
+  const [local, domain, ...extra] = email.split('@');
+  if (
+    email.length > 254 ||
+    extra.length > 0 ||
+    !local ||
+    local.length > 64 ||
+    local.startsWith('.') ||
+    local.endsWith('.') ||
+    local.includes('..') ||
+    !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(local)
+  ) {
+    return null;
+  }
+  const labels = domain?.split('.') || [];
+  if (
+    labels.length < 2 ||
+    labels.some((label) => label.length > 63 || !/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label)) ||
+    (labels.at(-1)?.length || 0) < 2
+  ) return null;
+  return { kind: 'email', identifier: email };
+}
+
+function hashOtp(code) {
+  return crypto.createHash('sha256').update(code).digest('hex');
+}
+
+async function saveLoginOtp(identifier, code, expiresAt) {
+  const codeHash = hashOtp(code);
+  if (isConnected()) {
+    await LoginOtp.findOneAndUpdate(
+      { identifier },
+      { codeHash, expiresAt },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    return;
+  }
+  memLoginOtps.set(identifier, { codeHash, expiresAt });
+}
+
+async function findLoginOtp(identifier) {
+  if (isConnected()) return LoginOtp.findOne({ identifier });
+  return memLoginOtps.get(identifier) || null;
+}
+
+async function removeLoginOtp(identifier) {
+  if (isConnected()) {
+    await LoginOtp.deleteOne({ identifier });
+    return;
+  }
+  memLoginOtps.delete(identifier);
+}
+
+function otpMatches(expectedHash, code) {
+  const actualHash = Buffer.from(hashOtp(code), 'hex');
+  const storedHash = Buffer.from(expectedHash, 'hex');
+  return actualHash.length === storedHash.length && crypto.timingSafeEqual(actualHash, storedHash);
 }
 
 async function findUserByVerifiedPhone(phone) {
@@ -74,62 +138,148 @@ function createAppSession(user) {
       phone: user.phone,
       age: user.age,
       sex: user.sex,
+      profileComplete: user.profileComplete ?? user.age > 0,
       results: user.results || [],
     },
   };
 }
 
-/** POST /api/auth/phone/send-otp */
-router.post('/phone/send-otp', async (req, res) => {
-  const phone = normalizePhone(req.body.phone);
-  if (!phone) {
-    return res.status(400).json({ success: false, code: 'INVALID_PHONE', message: 'Enter a valid phone number in international format, such as +14155552671.' });
+async function sendLoginOtp(req, res) {
+  const login = normalizeLoginIdentifier(req.body?.identifier);
+  if (!login) {
+    return res.status(400).json({
+      success: false,
+      code: 'INVALID_IDENTIFIER',
+      message: 'Enter a valid 10-digit phone number or email address.',
+    });
   }
 
-  return res.json({ success: true, message: 'Temporary verification code is active. Enter the configured code to continue.' });
-});
-
-/** POST /api/auth/phone/verify-otp */
-router.post('/phone/verify-otp', async (req, res) => {
-  const phone = normalizePhone(req.body.phone);
-  const code = String(req.body.code || '').trim();
-  if (!phone || !/^\d{6}$/.test(code)) {
-    return res.status(400).json({ success: false, code: 'INVALID_OTP', message: 'Enter a valid phone number and 6-digit code.' });
+  if (
+    login.kind === 'email' &&
+    (!process.env.SMTP_USER || !process.env.SMTP_PASS)
+  ) {
+    return res.status(503).json({
+      success: false,
+      message: 'Email OTP is not configured. Set SMTP_USER and SMTP_PASS on the backend.',
+    });
   }
 
-  if (code !== PHONE_OTP_CODE) {
-    return res.status(401).json({ success: false, code: 'INVALID_OTP', message: 'That code is invalid or expired.' });
+  const code = login.kind === 'phone'
+    ? PHONE_OTP_CODE
+    : crypto.randomInt(100000, 1000000).toString();
+  const expiresAt = new Date(Date.now() + LOGIN_OTP_TTL_MS);
+
+  try {
+    await saveLoginOtp(login.identifier, code, expiresAt);
+    if (login.kind === 'email') {
+      try {
+        await sendLoginOtpEmail(login.identifier, code);
+      } catch (err) {
+        await removeLoginOtp(login.identifier);
+        console.error('Login OTP email delivery error:', err.message);
+        return res.status(502).json({ success: false, message: 'Could not send the email OTP. Please try again.' });
+      }
+    }
+
+    return res.json({
+      success: true,
+      expiresInSeconds: LOGIN_OTP_TTL_MS / 1000,
+      message: login.kind === 'email' ? 'OTP sent to your email.' : 'Use 123456 to verify your phone number.',
+    });
+  } catch (err) {
+    console.error('Login OTP creation error:', err.message);
+    return res.status(500).json({ success: false, message: 'Could not send an OTP. Please try again.' });
+  }
+}
+
+async function verifyLoginOtp(req, res) {
+  const login = normalizeLoginIdentifier(req.body?.identifier);
+  const code = String(req.body?.code || '').trim();
+  if (!login || !/^\d{6}$/.test(code)) {
+    return res.status(400).json({
+      success: false,
+      code: 'INVALID_OTP',
+      message: 'Enter a valid phone number or email and a 6-digit OTP.',
+    });
   }
 
   try {
-    let user = await findUserByVerifiedPhone(phone);
-    if (!user) {
-      const digits = phone.replace(/\D/g, '');
-      const newUser = {
-        userId: generate13DigitUserId(),
-        name: 'VitaSyn User',
-        email: `phone-${digits}@users.vitasyn.invalid`,
-        phone,
-        age: 0,
-        sex: 'other',
-        results: [],
-      };
-      if (isConnected()) {
-        user = await User.create(newUser);
-      } else {
-        user = { ...newUser, createdAt: new Date() };
-        memUsers.push(user);
+    const challenge = await findLoginOtp(login.identifier);
+    if (!challenge || new Date(challenge.expiresAt) <= new Date()) {
+      if (challenge) await removeLoginOtp(login.identifier);
+      return res.status(400).json({ success: false, code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' });
+    }
+
+    if (!otpMatches(challenge.codeHash, code)) {
+      return res.status(401).json({ success: false, code: 'INVALID_OTP', message: 'That OTP is incorrect.' });
+    }
+    await removeLoginOtp(login.identifier);
+
+    let user;
+    if (login.kind === 'phone') {
+      user = await findUserByVerifiedPhone(login.identifier);
+      if (!user) {
+        const digits = login.identifier.replace(/\D/g, '');
+        const newUser = {
+          userId: generate13DigitUserId(),
+          name: 'VitaSyn User',
+          email: `phone-${digits}@users.vitasyn.invalid`,
+          phone: login.identifier,
+          age: 0,
+          sex: 'other',
+          profileComplete: false,
+          results: [],
+        };
+        if (isConnected()) user = await User.create(newUser);
+        else {
+          user = { ...newUser, createdAt: new Date() };
+          memUsers.push(user);
+        }
+      } else if (user.phone !== login.identifier) {
+        user.phone = login.identifier;
+        if (isConnected()) await user.save();
       }
-    } else if (user.phone !== phone) {
-      user.phone = phone;
-      if (isConnected()) await user.save();
+    } else {
+      user = await findUserByEmail(login.identifier);
+      if (!user) {
+        const newUser = {
+          userId: generate13DigitUserId(),
+          name: 'VitaSyn User',
+          email: login.identifier,
+          phone: '',
+          age: 0,
+          sex: 'other',
+          profileComplete: false,
+          results: [],
+        };
+        if (isConnected()) user = await User.create(newUser);
+        else {
+          user = { ...newUser, createdAt: new Date() };
+          memUsers.push(user);
+        }
+      }
     }
 
     return res.json(createAppSession(user));
   } catch (err) {
-    console.error('Phone OTP verification error:', err.message);
-    return res.status(502).json({ success: false, message: 'Could not verify the code. Please try again.' });
+    console.error('Login OTP verification error:', err.message);
+    return res.status(500).json({ success: false, message: 'Could not verify the OTP. Please try again.' });
   }
+}
+
+router.post('/otp/send', sendLoginOtp);
+router.post('/otp/verify', verifyLoginOtp);
+
+// Keep the previous phone endpoints working while using the same expiring challenge.
+router.post('/phone/send-otp', (req, res) => {
+  const phoneDigits = String(req.body.phone || '').replace(/\D/g, '');
+  req.body.identifier = phoneDigits.slice(-10);
+  return sendLoginOtp(req, res);
+});
+router.post('/phone/verify-otp', (req, res) => {
+  const phoneDigits = String(req.body.phone || '').replace(/\D/g, '');
+  req.body.identifier = phoneDigits.slice(-10);
+  return verifyLoginOtp(req, res);
 });
 
 /** POST /api/auth/google/session */
@@ -155,8 +305,9 @@ router.post('/google/session', async (req, res) => {
       (address) => address.id === clerkUser.primaryEmailAddressId
     )?.emailAddress;
     if (!primaryEmail) {
-      return res.status(400).json({ success: false, message: 'Your Google account must have a verified email address.' });
+      return res.status(400).json({ success: false, message: 'Your account must have a verified email address.' });
     }
+    const clerkName = [clerkUser.firstName, clerkUser.lastName].filter(Boolean).join(' ');
 
     let user = await findUserByClerkId(clerkUser.id);
     if (!user) {
@@ -168,17 +319,20 @@ router.post('/google/session', async (req, res) => {
 
     if (user) {
       user.clerkId = clerkUser.id;
+      if (clerkName) user.name = clerkName;
+      user.profileComplete = true;
       if (isConnected()) await user.save();
       else if (!memUsers.some((entry) => entry.userId === user.userId)) memUsers.push(user);
     } else {
       const newUser = {
         userId: generate13DigitUserId(),
         clerkId: clerkUser.id,
-        name: [clerkUser.firstName, clerkUser.lastName].filter(Boolean).join(' ') || primaryEmail.split('@')[0],
+        name: clerkName || primaryEmail.split('@')[0],
         email: primaryEmail.toLowerCase(),
         phone: '',
         age: 0,
         sex: 'other',
+        profileComplete: true,
         results: [],
       };
       if (isConnected()) user = await User.create(newUser);
@@ -191,7 +345,50 @@ router.post('/google/session', async (req, res) => {
     return res.json(createAppSession(user));
   } catch (err) {
     console.error('Clerk session exchange error:', err.message);
-    return res.status(401).json({ success: false, message: 'Could not verify your Google sign-in. Please try again.' });
+    return res.status(401).json({ success: false, message: 'Could not verify your social sign-in. Please try again.' });
+  }
+});
+
+router.post('/profile', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, message: 'Unauthorized.' });
+  }
+
+  let decoded;
+  try {
+    decoded = jwt.verify(authHeader.slice('Bearer '.length), JWT_SECRET);
+  } catch {
+    return res.status(401).json({ success: false, message: 'Invalid or expired token.' });
+  }
+
+  const name = String(req.body.name || '').trim();
+  const age = Number(req.body.age);
+  if (!name || name.length > 80 || !Number.isInteger(age) || age < 1 || age > 120) {
+    return res.status(400).json({ success: false, message: 'Enter a name and a valid age from 1 to 120.' });
+  }
+
+  try {
+    let user;
+    if (isConnected()) {
+      user = await User.findOne({ userId: decoded.userId });
+      if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+      user.name = name;
+      user.age = age;
+      user.profileComplete = true;
+      await user.save();
+    } else {
+      user = memUsers.find((entry) => entry.userId === decoded.userId);
+      if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+      user.name = name;
+      user.age = age;
+      user.profileComplete = true;
+    }
+
+    return res.json(createAppSession(user));
+  } catch (err) {
+    console.error('Profile update error:', err.message);
+    return res.status(500).json({ success: false, message: 'Could not save your profile. Please try again.' });
   }
 });
 
@@ -204,6 +401,34 @@ function generate13DigitUserId() {
     result += chars[bytes[i] % chars.length];
   }
   return result;
+}
+
+async function sendLoginOtpEmail(email, otp) {
+  const nodemailer = await import('nodemailer');
+  const port = Number(process.env.SMTP_PORT) || 587;
+  const transporter = nodemailer.default.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port,
+    secure: port === 465,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+
+  await transporter.sendMail({
+    from: `"VitaSyn Free AI" <${process.env.SMTP_USER}>`,
+    to: email,
+    subject: 'VitaSyn Free AI - Sign-in OTP',
+    text: `Your VitaSyn sign-in OTP is ${otp}. It expires in 2 minutes.`,
+    html: `
+      <div style="font-family: sans-serif; max-width: 480px; margin: auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
+        <h2 style="color: #f59e0b; margin-top: 0;">VitaSyn Free AI</h2>
+        <p>Use this 6-digit code to sign in:</p>
+        <div style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #15803d; background: #f0fdf4; padding: 14px 20px; text-align: center; border-radius: 8px; border: 1px solid #bbf7d0; margin: 16px 0;">
+          ${otp}
+        </div>
+        <p style="color: #64748b; font-size: 13px;">This code expires in 2 minutes. If you did not request it, you can ignore this email.</p>
+      </div>
+    `,
+  });
 }
 
 // Send OTP via email using nodemailer (with resilient console logging)
@@ -281,6 +506,7 @@ router.post('/register', async (req, res) => {
       phone: phone.trim(),
       age: Number(age),
       sex,
+      profileComplete: true,
       password: hashedPassword,
       results: [],
     };
