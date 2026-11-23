@@ -1,6 +1,6 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { generateEyeReport } from '../services/huggingfaceService.js';
+import { generateEyeReport } from '../services/geminiService.js';
 import { saveAssessment } from '../utils/store.js';
 
 const router = express.Router();
@@ -113,10 +113,9 @@ router.post('/analyze', async (req, res) => {
     });
   } catch (error) {
     console.error('Eye analysis error:', error);
-    return res.status(500).json({
+    return res.status(error.statusCode ? 502 : 500).json({
       success: false,
-      message: 'Failed to process eye assessment.',
-      error: error.message,
+      message: error.message || 'Failed to generate the eye report with Gemini.',
     });
   }
 });

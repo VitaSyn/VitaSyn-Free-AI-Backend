@@ -1,7 +1,7 @@
 {
   "name": "vitasyn-free-ai-backend",
   "version": "1.0.0",
-  "description": "VitaSyn Free AI Backend API - MERN Stack with Hugging Face AI Integration",
+  "description": "VitaSyn Free AI Backend API - MERN Stack with Gemini AI Integration",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@clerk/backend": "^3.20.1",
-    "@huggingface/inference": "^3.12.0",
     "axios": "^1.8.2",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",

@@ -1,7 +1,7 @@
 import express from 'express';
 import multer from 'multer';
 import jwt from 'jsonwebtoken';
-import { verifyHairImage, generateHairReport } from '../services/huggingfaceService.js';
+import { verifyHairImage, generateHairReport } from '../services/geminiService.js';
 import { saveAssessment } from '../utils/store.js';
 
 const router = express.Router();
@@ -64,25 +64,16 @@ router.post('/verify', upload.single('image'), async (req, res) => {
     console.log('Verification result:', JSON.stringify(verificationResult, null, 2));
     console.log('=====================================');
 
-    // Return appropriate HTTP status based on result
-    if (verificationResult.label === 'hf_api_error') {
-      return res.status(502).json({
-        success: false,
-        ...verificationResult,
-      });
-    }
-
     return res.json({
       success: true,
       ...verificationResult,
     });
   } catch (error) {
     console.error('Hair verification error:', error);
-    return res.status(500).json({
+    return res.status(error.statusCode ? 502 : 500).json({
       success: false,
       isHair: false,
-      message: 'Failed to verify image with AI.',
-      error: error.message,
+      message: error.message || 'Failed to verify image with Gemini.',
     });
   }
 });
@@ -147,10 +138,9 @@ router.post('/analyze', async (req, res) => {
     });
   } catch (error) {
     console.error('Hair analysis error:', error);
-    return res.status(500).json({
+    return res.status(error.statusCode ? 502 : 500).json({
       success: false,
-      message: 'Failed to process hair analysis.',
-      error: error.message,
+      message: error.message || 'Failed to generate the hair report with Gemini.',
     });
   }
 });

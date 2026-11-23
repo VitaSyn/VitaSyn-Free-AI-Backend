@@ -94,7 +94,7 @@ app.get('/api/health', (req, res) => {
     company: 'VitaSyn Pvt Ltd',
     website: 'https://vitasyn.in',
     database: mongoStatus,
-    hfReady: Boolean(process.env.HF_API_KEY),
+    geminiReady: Boolean(process.env.GEMINI_API_KEY),
     timestamp: new Date().toISOString(),
   });
 });
