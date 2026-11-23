@@ -2,6 +2,8 @@ import axios from 'axios';
 
 const GEMINI_MODEL = 'gemini-3.5-flash-lite';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const GEMINI_MAX_RETRIES = 2;
+const RETRYABLE_GEMINI_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 async function requestGemini(parts, generationConfig = {}) {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -10,28 +12,42 @@ async function requestGemini(parts, generationConfig = {}) {
   }
 
   let response;
-  try {
-    response = await axios.post(
-      GEMINI_API_URL,
-      {
-        contents: [{ role: 'user', parts }],
-        generationConfig,
-      },
-      {
-        headers: {
-          'x-goog-api-key': apiKey,
-          'Content-Type': 'application/json',
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      response = await axios.post(
+        GEMINI_API_URL,
+        {
+          contents: [{ role: 'user', parts }],
+          generationConfig,
         },
-        timeout: 30000,
+        {
+          headers: {
+            'x-goog-api-key': apiKey,
+            'Content-Type': 'application/json',
+          },
+          timeout: 30000,
+        }
+      );
+      break;
+    } catch (error) {
+      const status = error.response?.status;
+      if (attempt < GEMINI_MAX_RETRIES && RETRYABLE_GEMINI_STATUSES.has(status)) {
+        const retryAfterSeconds = Number(error.response?.headers?.['retry-after']);
+        const backoffMs = 1000 * (2 ** attempt);
+        const retryDelayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+          ? retryAfterSeconds * 1000
+          : backoffMs + Math.floor(Math.random() * 250);
+        await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelayMs, 5000)));
+        continue;
       }
-    );
-  } catch (error) {
-    const message = error.response?.data?.error?.message || error.message || 'Gemini request failed.';
-    const apiError = new Error(`Gemini API request failed: ${message}`);
-    if (error.response?.status) {
-      apiError.statusCode = error.response.status;
+
+      const message = error.response?.data?.error?.message || error.message || 'Gemini request failed.';
+      const apiError = new Error(`Gemini API request failed: ${message}`);
+      if (status) {
+        apiError.statusCode = status;
+      }
+      throw apiError;
     }
-    throw apiError;
   }
 
   const candidate = response.data?.candidates?.[0];

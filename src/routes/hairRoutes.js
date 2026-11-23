@@ -11,20 +11,31 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit
 });
 
-/**
- * Extract userId from Bearer token (if present), otherwise return null.
- */
-function extractUserId(req) {
+function requireAuthenticatedUser(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    try {
-      const decoded = jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET);
-      return decoded.userId || null;
-    } catch {
-      return null;
-    }
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      success: false,
+      message: 'Please sign in again before saving your hair report.',
+    });
   }
-  return null;
+
+  try {
+    const decoded = jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET);
+    if (!decoded.userId) throw new Error('Authenticated user ID is missing.');
+    req.userId = decoded.userId;
+    return next();
+  } catch {
+    return res.status(401).json({
+      success: false,
+      message: 'Your session is invalid or expired. Please sign in again to save your hair report.',
+    });
+  }
+}
+
+function getGeminiErrorStatus(error) {
+  if ([429, 503, 504].includes(error.statusCode)) return error.statusCode;
+  return error.statusCode ? 502 : 500;
 }
 
 /**
@@ -70,7 +81,7 @@ router.post('/verify', upload.single('image'), async (req, res) => {
     });
   } catch (error) {
     console.error('Hair verification error:', error);
-    return res.status(error.statusCode ? 502 : 500).json({
+    return res.status(getGeminiErrorStatus(error)).json({
       success: false,
       isHair: false,
       message: error.message || 'Failed to verify image with Gemini.',
@@ -82,7 +93,7 @@ router.post('/verify', upload.single('image'), async (req, res) => {
  * POST /api/hair/analyze
  * Generates tailored diagnostic report based on yes/no answers + optional description
  */
-router.post('/analyze', async (req, res) => {
+router.post('/analyze', requireAuthenticatedUser, async (req, res) => {
   try {
     const {
       dryness = 'normal',
@@ -107,7 +118,7 @@ router.post('/analyze', async (req, res) => {
     });
 
     // Extract userId from JWT so we can associate this assessment with the user
-    const userId = extractUserId(req);
+    const userId = req.userId;
 
     const assessmentDoc = await saveAssessment({
       userId,
@@ -138,7 +149,7 @@ router.post('/analyze', async (req, res) => {
     });
   } catch (error) {
     console.error('Hair analysis error:', error);
-    return res.status(error.statusCode ? 502 : 500).json({
+    return res.status(getGeminiErrorStatus(error)).json({
       success: false,
       message: error.message || 'Failed to generate the hair report with Gemini.',
     });

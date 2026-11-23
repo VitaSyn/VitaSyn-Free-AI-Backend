@@ -50,6 +50,8 @@ const AssessmentSchema = new mongoose.Schema(
     },
     generatedReport: {
       title: { type: String },
+      condition: { type: String },
+      healthScore: { type: Number },
       overview: { type: String },
       overallScore: { type: Number },
       colorScore: { type: Number },
